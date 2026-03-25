@@ -32,19 +32,18 @@
 
 
 #ifdef	__SER2NET_KERNEL
+
+
+
 typedef struct ser2net_iobuf_t {
-	volatile int	head, tail;
-	char	buf[SER2NET$SZ_IOBUF];
+	volatile int	head, tail,
+			fl_full;
+	char		data[SER2NET$SZ_IOBUF];
 } SER2NET$IOBUF;
 
 
-
-
-
-
-
 /*
- *   DESCRIPTION: Returns a length  of data in given  buffer.
+ *   DESCRIPTION: Check for data in the given buffer
  *
  *   INPUTS:
  *	a_iobuf:	A buffer to check
@@ -53,144 +52,113 @@ typedef struct ser2net_iobuf_t {
  *	NONE:
  *
  *   RETURNS:
- *	<length of data i nbuffer>
+ *	0:	No data
+ *	1:	Data is in buffer
  */
 static inline size_t s_buf_len(
 		SER2NET$IOBUF	*a_iobuf
 		)
 {
-	if (a_iobuf->head >= a_iobuf->tail)
-		return a_iobuf->head - a_iobuf->tail;
-
-	return SER2NET$SZ_IOBUF - a_iobuf->tail + a_iobuf->head;
-}
-
-/*
- *   DESCRIPTION: Returns a sizeof of free space in given buffer.
- *
- *   INPUTS:
- *	a_iobuf:	A buffer to check
- *
- *   OUTPUTS:
- *	NONE:
- *
- *   RETURNS:
- *	<length of free space>
- */
-static inline size_t s_buf_space(
-		SER2NET$IOBUF	*a_iobuf
-		)
-{
-	return SER2NET$SZ_IOBUF - s_buf_len(a_iobuf) - 1;
-}
-
-
-/*
- *   DESCRIPTION: Returns a pointer to free *continual* area to accept portion of data.
- *	Don't forget correct <head> after placing data in the area!
- *
- *
- *   INPUTS:
- *	a_iobuf:	A buffer to check
- *
- *   OUTPUTS:
- *	a_ptr:		An address of free space
- *
- *   RETURNS;
- *	0:		No free space
- *	0 >:		A size of the free space
- */
-static inline void s_buf_adjust_head (
-		SER2NET$IOBUF	*a_iobuf,
-			ssize_t	a_len
-		)
-{
-	a_iobuf->head = (a_iobuf->head + a_len) % SER2NET$SZ_IOBUF;		/* Adjust <heade> according has been processed length of data */
-}
-
-static inline size_t s_buf_free2put (
-		SER2NET$IOBUF	*a_iobuf,
-			char	**a_ptr
-		)
-{
-	*a_ptr = a_iobuf->buf + a_iobuf->head;					/* Precompute address of free space */
-
-	/*
-	 *        tail               head
-		   v                  v
-	+---------------------------------------------------------+
-	|  free    |       data       |      free                 |
-	+---------------------------------------------------------+
-	*/
-	if (a_iobuf->head >= a_iobuf->tail)
-		return (SER2NET$SZ_IOBUF - a_iobuf->head);
-
-	/*
-	 *        head               tail
-		   v                  v
-	+---------------------------------------------------------+
-	|   data   |       free       |      data                 |
-	+---------------------------------------------------------+
-	*/
-	return	a_iobuf->tail - a_iobuf->head;
+	return a_iobuf->tail != a_iobuf->head;
 }
 
 
 
 /*
- *   DESCRIPTION: Returns a pointer to free *continual* area to accept portion of data.
- *	Don't forget correct <head> after placing data in the area!
  *
- *
- *   INPUTS:
- *	a_iobuf:	A buffer to check
- *
- *   OUTPUTS:
- *	a_ptr:		An address of free space
- *
- *   RETURNS;
- *	0:		No free space
- *	0 >:		A size of the free space
  */
-static inline void s_buf_adjust_tail (
-		SER2NET$IOBUF	*a_iobuf,
-			ssize_t	a_len
+static inline int s_iobuf_getfree (
+		SER2NET$IOBUF	*a_ring,
+			char	**a_free
 		)
 {
-	a_iobuf->tail = (a_iobuf->tail + a_len) % SER2NET$SZ_IOBUF;		/* Adjust <tail> according has been processed length of data */
-}
+	if ( a_ring->fl_full )
+		return 0;			/* No free space */
 
-static inline size_t s_buf_data4get (
-		SER2NET$IOBUF	*a_iobuf,
-			char	**a_ptr
-		)
-{
-	*a_ptr = a_iobuf->buf + a_iobuf->tail;					/* Precompute address of unread data */
+
+	*a_free = a_ring->data + a_ring->tail;
 
 	/*
-	 *        tail               head
-		   v                  v
-	+---------------------------------------------------------+
-	|  free    |       data       |      free                 |
-	+---------------------------------------------------------+
+		    Old --->>> New
+	 +-----+--------------------+----------------------+
+	 | Free|       Data         |  Free                |
+	 +-----+--------------------+----------------------+
+	       ^                    ^
+	      Head                Tail
 	*/
-	if (a_iobuf->head >= a_iobuf->tail)
-		return	a_iobuf->head - a_iobuf->tail;
+	if ( a_ring->tail >= a_ring->head )
+		return SER2NET$SZ_IOBUF - a_ring->tail;
 
 
 	/*
-	 *        head               tail
-		   v                  v
-	+---------------------------------------------------------+
-	|   data   |       free       |      data                 |
-	+---------------------------------------------------------+
+					 Old --->>> New
+	 +-----+--------------------+----------------------+
+	 | Data|       Free         |  Data                |
+	 +-----+--------------------+----------------------+
+	       ^                    ^
+	      Tail                Head
 	*/
-	return (SER2NET$SZ_IOBUF - a_iobuf->head);
+
+	return a_ring->head - a_ring->tail;
+}
+
+static inline void s_iobuf_adjfree (
+		SER2NET$IOBUF	*a_ring,
+			int	a_count
+		)
+{
+	if ( !a_count )
+		return;
+
+	a_ring->tail = (a_ring->tail + a_count) % SER2NET$SZ_IOBUF;
+	a_ring->fl_full = (a_ring->tail == a_ring->head);
 }
 
 
 
+static inline int s_iobuf_getdata (
+		SER2NET$IOBUF	*a_ring,
+			char	**a_data
+		)
+{
+	if ( (!a_ring->fl_full) && (a_ring->head == a_ring->tail) )
+		return 0;							/* No data in the buffer */
 
+
+	*a_data = a_ring->data + a_ring->head;
+
+	/*
+		    Old --->>> New
+	 +-----+--------------------+----------------------+
+	 | Free|       Data         |  Free                |
+	 +-----+--------------------+----------------------+
+	       ^                    ^
+	      Head                Tail
+	*/
+	if ( a_ring->head < a_ring->tail )
+		return	a_ring->tail - a_ring->head;
+
+
+	/*
+					 Old --->>> New
+	 +-----+--------------------+----------------------+
+	 | Data|       Free         |  Data                |
+	 +-----+--------------------+----------------------+
+	       ^                    ^
+	      Tail                Head
+	*/
+	return	SER2NET$SZ_IOBUF - a_ring->head;
+
+}
+
+static inline void s_iobuf_adjdata (
+		SER2NET$IOBUF	*a_ring,
+			int	a_count
+		)
+{
+	a_ring->head = (a_ring->head + a_count) %SER2NET$SZ_IOBUF;
+	a_ring->fl_full = 0;						/* Buffer got free space !!! */
+}
 
 
 

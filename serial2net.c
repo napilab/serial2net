@@ -1,6 +1,6 @@
 #define	__MODULE__	"SER2NET"
-#define	__IDENT__	"X.00-03"
-#define	__REV__		"00.00.03"
+#define	__IDENT__	"X.00-04"
+#define	__REV__		"00.00.04"
 
 /*
 **++
@@ -70,6 +70,8 @@
 **  MODIFICATION HISTORY:
 **
 **	27-JAN-2026	RRL	X.00-03: Added Hub\Server mode support (p_ser2net_hub)
+**
+**	25-MAR-202f	RRL	X.00-04: Refactoring of IO Buffers
 **
 **--
 */
@@ -609,7 +611,7 @@ char	*l_ptr;
 		 */
 		l_iobuf = &l_ctx->ser2net;
 		//$PUTMSG("<%s>: l_iobuf[%p, head: %d, tail: %d]", l_ctx->devname, l_iobuf, l_iobuf->head, l_iobuf->tail);
-		if ( (l_len = s_buf_data4get(l_iobuf, &l_ptr)) )		/* Is there something to send over network ? */
+		if ( (l_len = s_iobuf_getdata(l_iobuf, &l_ptr)) )		/* Is there something to send over network ? */
 			{
 			l_iov.iov_base = l_ptr;
 			l_iov.iov_len  = l_len;
@@ -622,7 +624,7 @@ char	*l_ptr;
 						&l_ctx->sk.sin_addr, ntohs(l_ctx->sk.sin_port), l_sock, l_rc);
 				}
 			else	{
-				s_buf_adjust_tail(l_iobuf, l_rc);
+				s_iobuf_adjdata(l_iobuf, l_rc);
 				l_do_loop_flag = 1;
 
 				$PUTMSG("<%s>: Sent %d (from %d) octets", l_ctx->devname, l_rc, l_len);
@@ -632,7 +634,7 @@ char	*l_ptr;
 
 		l_iobuf = &l_ctx->net2ser;
 		//$PUTMSG("<%s>: l_iobuf[%p, head: %d, tail: %d]", l_ctx->devname, l_iobuf, l_iobuf->head, l_iobuf->tail);
-		if ( (l_len = s_buf_free2put(l_iobuf, &l_ptr)) )		/* Is there something to send over network ? */
+		if ( (l_len = s_iobuf_getfree(l_iobuf, &l_ptr)) )		/* Is there something to send over network ? */
 			{
 			l_iov.iov_base = l_ptr;
 			l_iov.iov_len  = l_len;
@@ -649,7 +651,7 @@ char	*l_ptr;
 							&l_ctx->sk.sin_addr, ntohs(l_ctx->sk.sin_port), l_sock, l_rc);
 					}
 				else	{
-					s_buf_adjust_head(l_iobuf, l_rc);
+					s_iobuf_adjfree(l_iobuf, l_rc);
 					l_do_loop_flag = 1;
 					wake_up_interruptible(&l_ctx->readq);
 
@@ -818,7 +820,7 @@ char	*l_ptr;
 		 */
 		l_iobuf = &l_ctx->ser2net;
 		//$PUTMSG("<%s>: l_iobuf[%p, head: %d, tail: %d]", l_ctx->devname, l_iobuf, l_iobuf->head, l_iobuf->tail);
-		if ( (l_len = s_buf_data4get(l_iobuf, &l_ptr)) )		/* Is there something to send over network ? */
+		if ( (l_len = s_iobuf_getdata(l_iobuf, &l_ptr)) )		/* Is there something to send over network ? */
 			{
 			l_iov.iov_base = l_ptr;
 			l_iov.iov_len  = l_len;
@@ -831,7 +833,7 @@ char	*l_ptr;
 						&l_ctx->sk.sin_addr, ntohs(l_ctx->sk.sin_port), l_sock, l_rc);
 				}
 			else	{
-				s_buf_adjust_tail(l_iobuf, l_rc);
+				s_iobuf_adjdata(l_iobuf, l_rc);
 				l_do_loop_flag = 1;
 
 				$PUTMSG("<%s>: Sent %d (from %d) octets", l_ctx->devname, l_rc, l_len);
@@ -841,7 +843,7 @@ char	*l_ptr;
 
 		l_iobuf = &l_ctx->net2ser;
 		//$PUTMSG("<%s>: l_iobuf[%p, head: %d, tail: %d]", l_ctx->devname, l_iobuf, l_iobuf->head, l_iobuf->tail);
-		if ( (l_len = s_buf_free2put(l_iobuf, &l_ptr)) )		/* Is there something to send over network ? */
+		if ( (l_len = s_iobuf_getfree(l_iobuf, &l_ptr)) )		/* Is there something to send over network ? */
 			{
 			l_iov.iov_base = l_ptr;
 			l_iov.iov_len  = l_len;
@@ -858,7 +860,7 @@ char	*l_ptr;
 							&l_ctx->sk.sin_addr, ntohs(l_ctx->sk.sin_port), l_sock, l_rc);
 					}
 				else	{
-					s_buf_adjust_head(l_iobuf, l_rc);
+					s_iobuf_adjfree(l_iobuf, l_rc);
 					l_do_loop_flag = 1;
 					wake_up_interruptible(&l_ctx->readq);
 
@@ -1065,9 +1067,9 @@ char	*l_ptr;
 
 
 	/* Wait until data is available */
-	wait_event_interruptible(l_ctx->readq, (s_buf_data4get(l_iobuf, &l_ptr) > 0) );
+	wait_event_interruptible(l_ctx->readq, (s_iobuf_getdata(l_iobuf, &l_ptr) > 0) );
 
-	l_len = s_buf_data4get(l_iobuf, &l_ptr);
+	l_len = s_iobuf_getdata(l_iobuf, &l_ptr);
 	l_len = min(l_len, a_count);
 
 	if ( !l_len )
@@ -1076,7 +1078,7 @@ char	*l_ptr;
 	if ( (l_rc = copy_to_user(a_buf, l_ptr, l_len)) )
 		return	-EFAULT;
 
-	s_buf_adjust_tail(l_iobuf, l_len);					/* Adjust <head> */
+	s_iobuf_adjdata(l_iobuf, l_len);					/* Adjust <head> */
 
 
 	$PUTMSG("<%s>: Read %ld octets", l_ctx->devname, l_len);
@@ -1104,7 +1106,7 @@ char	*l_ptr;
 	l_iobuf = &l_ctx->ser2net;
 
 
-	if ( !(l_len = s_buf_free2put(l_iobuf, &l_ptr)) )			/* Get pointer and size of free space */
+	if ( !(l_len = s_iobuf_getfree(l_iobuf, &l_ptr)) )			/* Get pointer and size of free space */
 		return	0;
 
 	l_len = min(l_len, a_count);
@@ -1113,7 +1115,7 @@ char	*l_ptr;
 	if ( (l_rc = copy_from_user(l_ptr, a_buf, l_len)) )			/* Get data into local buffer */
 		return -EFAULT;
 
-	s_buf_adjust_head(l_iobuf, l_len);					/* Adjust <head> */
+	s_iobuf_adjfree(l_iobuf, l_len);					/* Adjust <head> */
 
 	$PUTMSG("<%s>: Wrote %ld (from: %d) octets", l_ctx->devname, l_len, a_count);
 
@@ -1135,10 +1137,10 @@ char	*l_ptr;
 
 	l_ctx = s_ser2net_ctxs;
 
-	if ( s_buf_free2put(&l_ctx->ser2net, &l_ptr) )			/* Check a free space in output buffer */
+	if ( s_iobuf_getfree(&l_ctx->ser2net, &l_ptr) )			/* Check a free space in output buffer */
 		l_rc = POLLOUT;
 
-	if ( s_buf_data4get(&l_ctx->net2ser, &l_ptr) )			/* Check for data to be read from input buffer */
+	if ( s_iobuf_getdata(&l_ctx->net2ser, &l_ptr) )			/* Check for data to be read from input buffer */
 		l_rc = POLLIN;
 
 	return	l_rc;
