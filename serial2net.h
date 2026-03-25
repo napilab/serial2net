@@ -5,7 +5,7 @@
 **
 **  ENVIRONMENT: Linux
 **
-**  DESCRIPTION: Data Srtuctures and constant definitions is supposed to be used across all MODBUS-TCP2RTU's modules
+**  DESCRIPTION: Data Srtuctures and constant definitions is supposed to be used across all  modules
 **
 **
 **  AUTHORS: Ruslan R. (The BadAss Sysman) Laishev
@@ -197,6 +197,7 @@ static inline size_t s_buf_data4get (
 enum {
 	SER2NET$M_SER_OPEN = (1 << 0),
 	SER2NET$M_NET_OPEN = (1 << 1),
+	SER2NET$M_NET_HUB = (1 << 2),
 };
 
 

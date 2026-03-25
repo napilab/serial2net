@@ -10,3 +10,5 @@ CMakeFiles/
 *.autosave
 *.cmd
 *.order
+build/
+.qtcreator/

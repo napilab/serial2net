@@ -1,6 +1,6 @@
 #define	__MODULE__	"SER2NET"
-#define	__IDENT__	"X.00-02"
-#define	__REV__		"00.00.02"
+#define	__IDENT__	"X.00-03"
+#define	__REV__		"00.00.03"
 
 /*
 **++
@@ -30,6 +30,9 @@
 **							/dev/ser2net00 ---- host1:port1
 **								...
 **							/dev/ser2net02 ---- host3:port3
+**
+**		p_ser2net_hub -			Switch driver to Hub\Server mode, in this case <p_ser2net_peer> defines  local end-points (TCP-listeners) to
+**						accept remote connections.
 **
 **  EXAMPLE: (Note that the driver is compiled with *debug* option)
 **
@@ -66,6 +69,7 @@
 **
 **  MODIFICATION HISTORY:
 **
+**	27-JAN-2026	RRL	X.00-03: Added Hub\Server mode support (p_ser2net_hub)
 **
 **--
 */
@@ -120,6 +124,11 @@ static int p_ser2net_peer_nr = 0;							/* A number of array's elements */
 static char *p_ser2net_peer[SER2NET$K_MAXDEV];
 module_param_array(p_ser2net_peer, charp, &p_ser2net_peer_nr,  S_IRUGO | S_IWUSR);	/* Comma separated list of IP:port pairs */
 MODULE_PARM_DESC(p_serial2net_peer, "A comma-separated list of remote peers (eg: 127.0.0.1:8135,172.16.1.1:502)");
+
+
+static int p_ser2net_hub = 0;
+module_param( p_ser2net_hub, int, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(p_serial2net_hub, "Switch drive in Hub\\Server mode");
 
 
 
@@ -687,6 +696,240 @@ char	*l_ptr;
 }
 
 
+
+
+
+
+/*
+ *   DESCRIPTION: A server thread. Start listener on specified <IP>:<port, wait and ccept network connection request,
+ *	performs bidirectional data send\receive.
+ *
+ *   INPUTS:
+ *	a_ser2net:	A context for serial device --- <IP>:<port> pair to bind socket
+ *
+ *   OUTPUTS:
+ *	NONE
+ *
+ *   RETURNS:
+ *	NONE
+ */
+static int s_network_hub_proc(void *a_data)
+{
+SER2NET$CTX	*l_ctx = (SER2NET$CTX *) a_data;
+struct socket *l_sock, *l_sock_clnt;
+struct kvec l_iov;
+struct msghdr l_msg;
+int l_rc, l_len, l_do_loop_flag;
+SER2NET$IOBUF	*l_iobuf;
+char	*l_ptr;
+
+	$PUTMSG("<%s>: Listen on: %pI4:%d --- worker thread is started", l_ctx->devname, &l_ctx->sk.sin_addr, ntohs(l_ctx->sk.sin_port));
+
+
+	for ( l_do_loop_flag = 0;  !kthread_should_stop(); l_do_loop_flag = 0 )
+		{
+		/*
+		 * Is there data for remote host is configured ?
+		 */
+		if ( (!l_ctx->sk.sin_addr.s_addr) || (!l_ctx->sk.sin_port) )
+			{
+			/*
+			 * Nothing to do, sleep for some time ...
+			 */
+			ssleep(1);
+			continue;
+			}
+
+		/*
+		 * Do we need to open a network connection ?
+		 */
+		if ( !(l_ctx->flags & SER2NET$M_NET_OPEN) )
+			{
+			if ( 0 > (l_rc = sock_create_kern(&init_net, AF_INET, SOCK_STREAM, IPPROTO_TCP, &l_sock)) )
+				{
+				$LOG(KERN_ERR, "<%s>: sock_create_kern(%pI4:%d)->%d", l_ctx->devname,
+				     &l_ctx->sk.sin_addr, ntohs(l_ctx->sk.sin_port), l_rc );
+
+				ssleep(3);
+				continue;
+				}
+
+		$PUTMSG("<%s>: Listening on: %pI4:%d ...", l_ctx->devname,
+					     &l_ctx->sk.sin_addr, ntohs(l_ctx->sk.sin_port));
+
+
+			if ( 0 > (l_rc = kernel_bind(l_sock, (struct sockaddr *)&l_ctx->sk, sizeof(struct sockaddr))) )
+				{
+				/*
+				 * Error ? Ok, log this situation, sleep, and will try again ...
+				 */
+				$LOG(KERN_ERR, "<%s>: kernel_bind(%pI4:%d)->%d, retry after %d seconds ...", l_ctx->devname,
+					     &l_ctx->sk.sin_addr, ntohs(l_ctx->sk.sin_port), l_rc, 3);
+
+				sock_release(l_sock);
+
+				ssleep(3);
+				continue;
+				}
+
+			if ( 0 > (l_rc = kernel_listen(l_sock, 1)) )
+				{
+				/*
+				 * Error ? Ok, log this situation, sleep, and will try again ...
+				 */
+				$LOG(KERN_ERR, "<%s>: kernel_listen(%pI4:%d)->%d, retry after %d seconds ...", l_ctx->devname,
+					     &l_ctx->sk.sin_addr, ntohs(l_ctx->sk.sin_port), l_rc, 3);
+
+				sock_release(l_sock);
+
+				ssleep(3);
+				continue;
+				}
+
+			if (0 > (l_rc = kernel_accept(l_sock, &l_sock_clnt, 0)) )
+				{
+				/*
+				 * Error ? Ok, log this situation, sleep, and will try again ...
+				 */
+				$LOG(KERN_ERR, "<%s>: kernel_accept(%pI4:%d)->%d, retry after %d seconds ...", l_ctx->devname,
+					     &l_ctx->sk.sin_addr, ntohs(l_ctx->sk.sin_port), l_rc, 3);
+
+				sock_release(l_sock);
+
+				ssleep(3);
+				continue;
+				}
+			else	{
+				tcp_sock_set_nodelay(l_sock->sk);
+
+
+				$PUTMSG("<%s>: Connected to: %pI4:%d, sock:%p", l_ctx->devname,
+					&l_ctx->sk.sin_addr, ntohs(l_ctx->sk.sin_port), l_sock);
+
+				l_ctx->flags |= SER2NET$M_NET_OPEN;
+				l_sock->sk->sk_user_data = l_ctx;
+				l_sock->sk->sk_data_ready = s_network$sk_data_ready;
+				}
+			}
+
+
+		/*
+		 * Do main I/O from serial's buffer to socket and back
+		 */
+		l_iobuf = &l_ctx->ser2net;
+		//$PUTMSG("<%s>: l_iobuf[%p, head: %d, tail: %d]", l_ctx->devname, l_iobuf, l_iobuf->head, l_iobuf->tail);
+		if ( (l_len = s_buf_data4get(l_iobuf, &l_ptr)) )		/* Is there something to send over network ? */
+			{
+			l_iov.iov_base = l_ptr;
+			l_iov.iov_len  = l_len;
+
+			memset(&l_msg, 0, sizeof(l_msg));
+
+			if ( 0 > (l_rc = kernel_sendmsg(l_sock, &l_msg, &l_iov, 1, l_len)) )
+				{
+				$LOG(KERN_ERR, "<%s>: Sending to: %pI4:%d, sock: %p --- failed, errno: %d", l_ctx->devname,
+						&l_ctx->sk.sin_addr, ntohs(l_ctx->sk.sin_port), l_sock, l_rc);
+				}
+			else	{
+				s_buf_adjust_tail(l_iobuf, l_rc);
+				l_do_loop_flag = 1;
+
+				$PUTMSG("<%s>: Sent %d (from %d) octets", l_ctx->devname, l_rc, l_len);
+				}
+			}
+
+
+		l_iobuf = &l_ctx->net2ser;
+		//$PUTMSG("<%s>: l_iobuf[%p, head: %d, tail: %d]", l_ctx->devname, l_iobuf, l_iobuf->head, l_iobuf->tail);
+		if ( (l_len = s_buf_free2put(l_iobuf, &l_ptr)) )		/* Is there something to send over network ? */
+			{
+			l_iov.iov_base = l_ptr;
+			l_iov.iov_len  = l_len;
+
+			memset(&l_msg, 0, sizeof(l_msg));
+
+			if ( 0 < (l_rc = kernel_recvmsg(l_sock, &l_msg, &l_iov, 1, l_len, MSG_PEEK | MSG_DONTWAIT)) )
+				{
+				$PUTMSG("<%s>: l_rc: %d", l_ctx->devname, l_rc);
+
+				if ( 0 > (l_rc = kernel_recvmsg(l_sock, &l_msg, &l_iov, 1, l_len, 0)) )
+					{
+					$LOG(KERN_ERR, "<%s>: Receiving from: %pI4:%d, sock: %p --- failed, errno: %d", l_ctx->devname,
+							&l_ctx->sk.sin_addr, ntohs(l_ctx->sk.sin_port), l_sock, l_rc);
+					}
+				else	{
+					s_buf_adjust_head(l_iobuf, l_rc);
+					l_do_loop_flag = 1;
+					wake_up_interruptible(&l_ctx->readq);
+
+					$PUTMSG("<%s>: Rcvd %d octets", l_ctx->devname, l_rc);
+					}
+				}
+			else	{
+				if ( (l_rc == -EAGAIN) || (l_rc == -EWOULDBLOCK) )
+					{
+					/* It's OK, Just no data to read */
+					}
+				else	{
+					if ( l_rc == 0 )
+						{
+						$PUTMSG("<%s>: Remote peer: %pI4:%d, sock: %p --- close connection", l_ctx->devname,
+								&l_ctx->sk.sin_addr, ntohs(l_ctx->sk.sin_port), l_sock);
+						}
+					else	{
+						$LOG(KERN_ERR, "<%s>: kernel_recvmsg(%pI4:%d, MSG_PEEK | MSG_DONTWAIT)->%d", l_ctx->devname,
+							&l_ctx->sk.sin_addr, ntohs(l_ctx->sk.sin_port), l_rc);
+						}
+
+					sock_release(l_sock);
+					l_ctx->flags &= (~SER2NET$M_NET_OPEN);
+					}
+				}
+			}
+
+
+		if ( l_do_loop_flag )
+			continue;
+
+		l_rc = wait_event_interruptible_timeout(l_ctx->writeq,
+							(s_buf_len(&l_ctx->net2ser) > 0)
+							, msecs_to_jiffies(5*1024));
+		}
+
+	if ( l_ctx->flags & SER2NET$M_NET_OPEN )
+		sock_release(l_sock);
+
+	$PUTMSG("<%s>: task: %p --- terminated", l_ctx->devname, l_ctx->net_task);
+
+	return 0;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 /*
  *   DESCRIPTION: Allocate ser2net context for a caller.
  *	- lookup a <ser2net> context for a given <a_filep.path>
@@ -1129,6 +1372,7 @@ char	*l_cp;
 
 		s_ser2net_ctxs[i].sk.sin_port =  htons(l_rc);
 		s_ser2net_ctxs[i].sk.sin_family = AF_INET;
+		s_ser2net_ctxs[i].flags |= (SER2NET$M_NET_HUB & p_ser2net_hub);
 		}
 
 
