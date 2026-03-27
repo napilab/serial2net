@@ -65,7 +65,16 @@ static inline size_t s_buf_len(
 
 
 /*
+ *  DESCRIPTION: Return a continues space in the I/O buffer
  *
+ *  INPUTS:
+ *	a_ring:		Address of the ring I/O buffer
+ *
+ *  OUTPUTS:
+ *	a_free:		An address of first free byte in the buffer
+ *
+ *  RETURNS:
+ *	Size of the space
  */
 static inline int s_iobuf_getfree (
 		SER2NET$IOBUF	*a_ring,
@@ -76,7 +85,7 @@ static inline int s_iobuf_getfree (
 		return 0;			/* No free space */
 
 
-	*a_free = a_ring->data + a_ring->tail;
+	*a_free = &a_ring->data[a_ring->tail];
 
 	/*
 		    Old --->>> New
@@ -102,6 +111,20 @@ static inline int s_iobuf_getfree (
 	return a_ring->head - a_ring->tail;
 }
 
+/*
+ *  DESCRIPTION: Correct ring buffer counters according has been allocated space,
+ *	set "buffer if full" flag if need.
+ *
+ *  INPUTS:
+ *	a_ring:		Address of the ring I/O buffer
+ *	a_count:	A count of has been used octets in the buffer
+ *
+ *  OUTPUTS:
+ *	NONE
+ *
+ *  RETURNS:
+ *	NONE
+ */
 static inline void s_iobuf_adjfree (
 		SER2NET$IOBUF	*a_ring,
 			int	a_count
@@ -125,7 +148,7 @@ static inline int s_iobuf_getdata (
 		return 0;							/* No data in the buffer */
 
 
-	*a_data = a_ring->data + a_ring->head;
+	*a_data = &a_ring->data[a_ring->head];
 
 	/*
 		    Old --->>> New
@@ -189,6 +212,7 @@ typedef struct ser2net_ctx_t {
 	struct cdev	scdev;
 
 	struct tty_struct tty;
+	atomic_t	count;
 } SER2NET$CTX;
 
 
@@ -201,7 +225,8 @@ enum {
 	SER2NET$K_CTL_SETDVI,				/* Set Device Information vector for specified <ser2netXX>*/
 	SER2NET$K_CTL_GETDVI,				/* Get --//-- */
 
-	SER2NET$K_CTL_EOL,
+
+	SER2NET$K_CTL_EOL				/* End-of-list marker */
 };
 
 #define	IOCTL$K_GETINFO		_IOWR(135,	SER2NET$K_CTL_GETINFO, char *)
@@ -226,13 +251,6 @@ enum {
     ((uint32_t)(b) << 16) | \
     ((uint32_t)(c) <<  8) | \
     ((uint32_t)(d)      )) \
-)
-
-#define $IPv4_ADDR33(a,b,c,d) ( \
-    ((uint32_t)(a) << 24) | \
-    ((uint32_t)(b) << 16) | \
-    ((uint32_t)(c) <<  8) | \
-    ((uint32_t)(d)      ) \
 )
 
 #endif

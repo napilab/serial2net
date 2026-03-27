@@ -1,6 +1,6 @@
 #define	__MODULE__	"SER2NET"
-#define	__IDENT__	"X.00-04"
-#define	__REV__		"00.00.04"
+#define	__IDENT__	"X.00-05"
+#define	__REV__		"00.00.05"
 
 /*
 **++
@@ -71,7 +71,9 @@
 **
 **	27-JAN-2026	RRL	X.00-03: Added Hub\Server mode support (p_ser2net_hub)
 **
-**	25-MAR-202f	RRL	X.00-04: Refactoring of IO Buffers
+**	25-MAR-2026	RRL	X.00-04: Refactoring of IO Buffers
+**
+**	27-MAR-2026	RRL	X.00-05: Fixed of lost of events
 **
 **--
 */
@@ -151,7 +153,7 @@ MODULE_PARM_DESC(p_serial2net_hub, "Switch drive in Hub\\Server mode");
 #endif
 
 #define $SHOW_PARM(name, value, format) $TRACE(__MODULE__ " : " #name " = " format, (value))
-#define $SHOW_PTR(var)                  $SHOW_PARM(var, var, "%#x")
+#define $SHOW_PTR(var)                  $SHOW_PARM(var, var, "%p")
 #define $SHOW_XL(var)			$SHOW_PARM(var, var, "%#x")
 #define $SHOW_STR(var)                  $SHOW_PARM(var, (var ? var : "UNDEF(NULL)"), "'%s'")
 #define $SHOW_INT(var)                  $SHOW_PARM(var, ((int) var), "%d")
@@ -361,15 +363,21 @@ int	l_rc;
 	if ( (a_outsz - *a_loff) < LOGENT$SZ_MSG )
 		return	*a_loff = 0;						/* End-of-file */
 
-	if ( list_empty(&s_logent_list) )
-		return	0;							/* Noging to do */
 
 
 	l_rc = 0;
 
 	spin_lock(&s_logent_list_lock);
 
+	if ( list_empty(&s_logent_list) )
+		return	spin_unlock(&s_logent_list_lock),
+			0;							/* Noging to do */
+
+
+
 	l_logent = list_first_entry(&s_logent_list,  LOGENT, link);
+
+
 
 	if ( (a_outsz - *a_loff) >= l_logent->len )
 		{
@@ -527,11 +535,12 @@ static  int s_ser2net$ctl_shut(void)
  *   RETURNS:
  *	NONE
  */
-static void s_network$sk_data_ready (struct sock *a_sk)
+static void s_network_sk_data_ready (struct sock *a_sk)
 {
 SER2NET$CTX	*l_ctx = a_sk->sk_user_data;
 
-	$PUTMSG("<%s>: Wake-up! a_sk: %p", l_ctx->devname, a_sk);
+	$PUTMSG("<%s>: Wake-up! a_sk: %p, waitq: %p", l_ctx->devname, a_sk, &l_ctx->writeq);
+	atomic_add(1, &l_ctx->count);
 	wake_up_interruptible(&l_ctx->writeq);
 }
 
@@ -601,7 +610,7 @@ char	*l_ptr;
 
 				l_ctx->flags |= SER2NET$M_NET_OPEN;
 				l_sock->sk->sk_user_data = l_ctx;
-				l_sock->sk->sk_data_ready = s_network$sk_data_ready;
+				l_sock->sk->sk_data_ready = s_network_sk_data_ready;
 				}
 			}
 
@@ -684,9 +693,19 @@ char	*l_ptr;
 		if ( l_do_loop_flag )
 			continue;
 
+
 		l_rc = wait_event_interruptible_timeout(l_ctx->writeq,
+							( (atomic_read(&l_ctx->count) > 0)  ||
 							(s_buf_len(&l_ctx->net2ser) > 0)
+							|| (s_buf_len(&l_ctx->ser2net) > 0) )
 							, msecs_to_jiffies(5*1024));
+
+
+		if ( l_rc < 0 )
+			$SHOW_INT(l_rc);
+
+		atomic_set(&l_ctx->count, 0);
+
 		}
 
 	if ( l_ctx->flags & SER2NET$M_NET_OPEN )
@@ -810,7 +829,7 @@ char	*l_ptr;
 
 				l_ctx->flags |= SER2NET$M_NET_OPEN;
 				l_sock->sk->sk_user_data = l_ctx;
-				l_sock->sk->sk_data_ready = s_network$sk_data_ready;
+				l_sock->sk->sk_data_ready = s_network_sk_data_ready;
 				}
 			}
 
