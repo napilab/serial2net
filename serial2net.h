@@ -212,7 +212,8 @@ typedef struct ser2net_ctx_t {
 	struct cdev	scdev;
 
 	struct tty_struct tty;
-	atomic_t	count;
+	atomic_t	indata_fl,
+			outdata_fl;
 } SER2NET$CTX;
 
 

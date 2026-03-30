@@ -1,6 +1,6 @@
 #define	__MODULE__	"SER2NET"
-#define	__IDENT__	"X.00-05"
-#define	__REV__		"00.00.05"
+#define	__IDENT__	"X.00-06"
+#define	__REV__		"00.00.06"
 
 /*
 **++
@@ -74,6 +74,8 @@
 **	25-MAR-2026	RRL	X.00-04: Refactoring of IO Buffers
 **
 **	27-MAR-2026	RRL	X.00-05: Fixed of lost of events
+**
+**	30-MAR-2026	RRL	X.00-06: Fixed of lost of events on incoming data
 **
 **--
 */
@@ -182,6 +184,8 @@ static struct class	*s_class;
  */
 #define	SER2NET$K_CTLDEV	"ser2net"						/* Pseudo-device to accept IOCTL control requests */
 static struct miscdevice s_ser2net$ctl;							/* Pseudo-device to accept IOCTL control requests */
+
+
 
 
 /* /dev/ser2net$ctl
@@ -308,8 +312,8 @@ static	atomic64_t	l_seq;
 	if ( (l_rc = s_get_logent(&l_logent)) )					/* Get free entry for log message */
 		return;
 
-	ktime_get_ts64(&l_logent->ts);
-	atomic64_add(1, &l_seq);
+	ktime_get_ts64(&l_logent->ts);						/* Get timestamp for message */
+	atomic64_add(1, &l_seq);						/* Get sequence of message */
 
 
 	/*
@@ -540,7 +544,7 @@ static void s_network_sk_data_ready (struct sock *a_sk)
 SER2NET$CTX	*l_ctx = a_sk->sk_user_data;
 
 	$PUTMSG("<%s>: Wake-up! a_sk: %p, waitq: %p", l_ctx->devname, a_sk, &l_ctx->writeq);
-	atomic_add(1, &l_ctx->count);
+	atomic_add(1, &l_ctx->indata_fl);
 	wake_up_interruptible(&l_ctx->writeq);
 }
 
@@ -662,6 +666,7 @@ char	*l_ptr;
 				else	{
 					s_iobuf_adjfree(l_iobuf, l_rc);
 					l_do_loop_flag = 1;
+					atomic_add(1, &l_ctx->outdata_fl);
 					wake_up_interruptible(&l_ctx->readq);
 
 					$PUTMSG("<%s>: Rcvd %d octets", l_ctx->devname, l_rc);
@@ -671,6 +676,7 @@ char	*l_ptr;
 				if ( (l_rc == -EAGAIN) || (l_rc == -EWOULDBLOCK) )
 					{
 					/* It's OK, Just no data to read */
+					l_do_loop_flag = 1;
 					}
 				else	{
 					if ( l_rc == 0 )
@@ -695,7 +701,7 @@ char	*l_ptr;
 
 
 		l_rc = wait_event_interruptible_timeout(l_ctx->writeq,
-							( (atomic_read(&l_ctx->count) > 0)  ||
+							( (atomic_read(&l_ctx->indata_fl) > 0)  ||
 							(s_buf_len(&l_ctx->net2ser) > 0)
 							|| (s_buf_len(&l_ctx->ser2net) > 0) )
 							, msecs_to_jiffies(5*1024));
@@ -704,7 +710,7 @@ char	*l_ptr;
 		if ( l_rc < 0 )
 			$SHOW_INT(l_rc);
 
-		atomic_set(&l_ctx->count, 0);
+		atomic_set(&l_ctx->indata_fl, 0);
 
 		}
 
@@ -1084,9 +1090,15 @@ char	*l_ptr;
 	l_ctx = a_filp->private_data;
 	l_iobuf = &l_ctx->net2ser;
 
+	$PUTMSG("<%s>: Do Read %ld octets ...", l_ctx->devname, a_count);
+
 
 	/* Wait until data is available */
-	wait_event_interruptible(l_ctx->readq, (s_iobuf_getdata(l_iobuf, &l_ptr) > 0) );
+	l_rc = wait_event_interruptible(l_ctx->readq,
+					( (atomic_read(&l_ctx->outdata_fl) > 0)
+					|| (s_iobuf_getdata(l_iobuf, &l_ptr) > 0) ) );
+
+	atomic_set(&l_ctx->outdata_fl, 0);
 
 	l_len = s_iobuf_getdata(l_iobuf, &l_ptr);
 	l_len = min(l_len, a_count);
@@ -1154,13 +1166,16 @@ int	l_rc;
 SER2NET$CTX	*l_ctx;
 char	*l_ptr;
 
-	l_ctx = s_ser2net_ctxs;
+	l_ctx = a_filp->private_data;
+	l_rc = 0;
 
 	if ( s_iobuf_getfree(&l_ctx->ser2net, &l_ptr) )			/* Check a free space in output buffer */
 		l_rc = POLLOUT;
 
 	if ( s_iobuf_getdata(&l_ctx->net2ser, &l_ptr) )			/* Check for data to be read from input buffer */
 		l_rc = POLLIN;
+
+	$PUTMSG("<%s>: Do Poll, revents: %0x", l_ctx->devname, l_rc);
 
 	return	l_rc;
 }
