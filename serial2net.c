@@ -1,6 +1,7 @@
+#if 1
 #define	__MODULE__	"SER2NET"
-#define	__IDENT__	"X.00-06"
-#define	__REV__		"00.00.06"
+#define	__IDENT__	"X.00-07"
+#define	__REV__		"00.07.00"
 
 /*
 **++
@@ -77,11 +78,16 @@
 **
 **	30-MAR-2026	RRL	X.00-06: Fixed of lost of events on incoming data
 **
+**	 1-APR-2026	RRL	X.00-06ECO1: Fixed segmentation fault on "tail -f /dev/ser2net"
+**
+**	 2-APR-2026	RRL	X.00-07: Fixed CPU consuming and losing of I/O events.
+**
+**
 **--
 */
 #include	<linux/init.h>
 #include	<linux/module.h>
-#include	<linux/fs.h>
+#include	<linux/kernel.h>
 #include	<linux/cdev.h>
 #include	<linux/uaccess.h>
 #include	<linux/mutex.h>
@@ -95,7 +101,6 @@
 #include	<linux/socket.h>
 #include	<linux/slab.h>
 #include	<linux/mempool.h>
-#include	<linux/list.h>
 #include	<linux/kref.h>
 #include	<linux/spinlock.h>
 #include	<linux/tcp.h>
@@ -112,9 +117,10 @@
 
 
 MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("A yet anoteher driver to pass serial I/O over network");
+
 static const char s_author_desc [] =  "Ruslan R. Laishev (AKA: BadAss Sysman, SysManOne), zator@yandex.ru";
 MODULE_AUTHOR("Ruslan R. Laishev (AKA: BadAss Sysman, SysManOne), zator@yandex.ru");
-MODULE_DESCRIPTION("A yet anoteher driver to pass serial I/O over network");
 
 
 static int p_ser2net_trace = 1;
@@ -148,6 +154,7 @@ MODULE_PARM_DESC(p_serial2net_hub, "Switch drive in Hub\\Server mode");
 #define $TRACE(fmt, ...)	do { if (p_ser2net_trace) printk(KERN_DEBUG  "[ %#x " __MODULE__ "\\%s:%d] " fmt "\n", current->tgid, __FUNCTION__,  __LINE__ , ## __VA_ARGS__); } while (0)
 #define $LOG(lvl, fmt, ...)	do { printk(lvl  "[ %#x " __MODULE__ "\\%s:%d] " fmt "\n", current->tgid, __FUNCTION__,  __LINE__ , ## __VA_ARGS__); } while (0)
 #define $PUTMSG(fmt, ...)	s_ser2net$ctl_putmsg(fmt "\n", __FUNCTION__,  __LINE__ , ## __VA_ARGS__)
+//#define $PUTMSG(fmt, ...)	do { if (p_ser2net_trace) printk(KERN_ALERT  "[ %#x " __MODULE__ "\\%s:%d] " fmt "\n", current->tgid, __FUNCTION__,  __LINE__ , ## __VA_ARGS__); } while (0)
 #else
 	#define	$TRACE(fmt, ...)	{}
 	#define $LOG(lvl, fmt, ...)	{ printk(lvl  "[ %#x " __MODULE__ "] " fmt "\n", current->tgid, ## __VA_ARGS__); }
@@ -191,22 +198,18 @@ static struct miscdevice s_ser2net$ctl;							/* Pseudo-device to accept IOCTL c
 /* /dev/ser2net$ctl
  * ------------------------------------------------------------------------------------------------------------------------------------------------------
  */
-#define		LOGENT$SZ_MSG		512
+#define		LOGENT$SZ_MSG		256
 #define		LOGENT$SZ_DEFENT_NR	132
 static LIST_HEAD(s_logent_list);							/* A list of log messages */
-static atomic64_t	s_logent_list_nr;						/* A number of entries in the list */
+static atomic64_t	s_logent_list_nr;						/* A number of entries in the <s_logent_listlist> */
 DEFINE_SPINLOCK(s_logent_list_lock);							/* A spinlock to coordinate access to the <s_logent_list> */
 
 
 typedef struct	logent_t {
 	struct list_head	link;
 	struct timespec64	ts;
-		char	__fill1[64];
-		uint64_t	seq;
-		uint16_t	len;
-
-		char	__fill2[64];
-		char		text[LOGENT$SZ_MSG + 1];
+			int	len;
+			char	text[LOGENT$SZ_MSG + 8];
 } LOGENT;
 
 struct kmem_cache	*s_logent_cache;
@@ -218,7 +221,8 @@ static int	s_cre_logent_slab	(
 				size_t	a_entsz
 					)
 {
-	if ( !(s_logent_cache = kmem_cache_create( "LOG Msgs", a_entsz, 0, 0, NULL)) )
+
+	if ( !(s_logent_cache = kmem_cache_create( "LOG Msgs", a_entsz, 0, SLAB_HWCACHE_ALIGN | SLAB_CONSISTENCY_CHECKS, NULL)) )
 		{
 		$LOG(KERN_ERR, "kmem_cache_create() failed");
 		return	-ENOMEM;
@@ -226,6 +230,8 @@ static int	s_cre_logent_slab	(
 
 	if ( !(s_logent_pool =  mempool_create_slab_pool( a_defent_nr, s_logent_cache)) )
 		{
+		kmem_cache_destroy(s_logent_cache);
+
 		$LOG(KERN_ERR, "mempool_init_slab_pool() failed");
 		return	-ENOMEM;
 		}
@@ -240,7 +246,7 @@ LOGENT	*l_logent, *l_tmp;
 	list_for_each_entry_safe(l_logent, l_tmp, &s_logent_list, link)
 		{
 		list_del(&l_logent->link);
-		mempool_free(l_logent, s_logent_pool);
+		kmem_cache_free(s_logent_cache, l_logent);
 		}
 
 
@@ -254,14 +260,13 @@ static inline int	s_get_logent (
 			)
 {
 	/* Get from memory pool */
-	if ( !(*a_logent = mempool_alloc(s_logent_pool, GFP_NOIO)) )
+	if ( !(*a_logent = kmem_cache_zalloc(s_logent_cache, GFP_KERNEL)) )
 		{
-		$LOG(KERN_ERR, "Error allocation memory for IOB ARGs");
+		$LOG(KERN_ERR, "Error allocation memory for LOGENT");
 		return	-ENOMEM;
 		}
 
-	/* Zeroing new block, adjust statistic counter, initialize a reference count	*/
-	memset(*a_logent, 0, sizeof(LOGENT));
+
 
 	INIT_LIST_HEAD(&(*a_logent)->link);
 	return	0;
@@ -271,8 +276,7 @@ static inline void	s_free_logent (
 		LOGENT		*a_logent
 			)
 {
-	memset(a_logent, 0, sizeof(LOGENT));
-	mempool_free(a_logent, s_logent_pool);
+	kmem_cache_free(s_logent_cache, a_logent);
 }
 
 /*
@@ -322,20 +326,19 @@ static	atomic64_t	l_seq;
 	 */
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wformat"
-	l_logent->len  = snprintf(l_logent->text, LOGENT$SZ_MSG, l_lfmt, l_logent->ts.tv_sec, l_logent->ts.tv_nsec/(1024*1024),
+	l_logent->len  = scnprintf(l_logent->text, LOGENT$SZ_MSG, l_lfmt, l_logent->ts.tv_sec, l_logent->ts.tv_nsec/(1024*1024),
 				  current->tgid, l_seq, a_func, a_line);
-#pragma GCC diagnostic pop
 
+#pragma GCC diagnostic pop
 
 	l_logent->len = min(l_logent->len, LOGENT$SZ_MSG);
 
 	/* Format a variable part of the message */
 	va_start (a_arglist, a_line);
-	l_logent->len  += vsnprintf(l_logent->text + l_logent->len, LOGENT$SZ_MSG - l_logent->len, a_fmt, a_arglist);
+	l_logent->len  += vscnprintf(l_logent->text + l_logent->len, LOGENT$SZ_MSG - l_logent->len, a_fmt, a_arglist);
 	va_end (a_arglist);
 
 	l_logent->len = min(l_logent->len, LOGENT$SZ_MSG);
-
 
 	spin_lock(&s_logent_list_lock);
 	atomic64_add(1, &s_logent_list_nr);
@@ -359,17 +362,15 @@ static	int s_ser2net$ctl_release(struct inode *a_inode, struct file *a_filp)
 static	ssize_t s_ser2net$ctl_read(struct file *a_filp, char __user *a_outbuf, size_t a_outsz, loff_t *a_loff)
 {
 LOGENT	*l_logent;
-int	l_rc;
+int	l_rc, l_len;
+char	l_buf[LOGENT$SZ_MSG + 32];
+
 
 	if ( a_outsz  < LOGENT$SZ_MSG )
 		return	-ENOMEM;
 
 	if ( (a_outsz - *a_loff) < LOGENT$SZ_MSG )
-		return	*a_loff = 0;						/* End-of-file */
-
-
-
-	l_rc = 0;
+		return	(*a_loff = 0);						/* End-of-file */
 
 	spin_lock(&s_logent_list_lock);
 
@@ -378,25 +379,31 @@ int	l_rc;
 			0;							/* Noging to do */
 
 
-
 	l_logent = list_first_entry(&s_logent_list,  LOGENT, link);
+	l_len = l_logent->len;
+	l_rc = 0;
 
-
-
-	if ( (a_outsz - *a_loff) >= l_logent->len )
+	if ( (a_outsz - *a_loff) >= l_len )
 		{
-		l_rc  = l_logent->len;
 		atomic64_sub(1, &s_logent_list_nr);
 		list_del(&l_logent->link);
 		}
+	else	l_rc = -ENOBUFS;
+
 
 	spin_unlock(&s_logent_list_lock);
 
-
-	if ( l_rc > 0 )
+	if ( l_rc >= 0 )
 		{
-		memcpy(a_outbuf, l_logent->text,  l_rc);
-		*a_loff += l_rc;
+		/* To resolve:
+		 * usercopy: Kernel memory exposure attempt detected from SLUB object 'xfrm_dst' (offset 36, size 95)!
+		 * we copy firstly a log message to local buffer and after that copy to target
+		 */
+		memcpy(l_buf, l_logent->text, l_len);
+		if ( (l_rc = copy_to_user(a_outbuf, l_buf, l_len)) )
+			l_rc = -ENOSPC;
+		else	(*a_loff = (l_rc = l_len) );				/* Adjust offset and set return value to length of data */
+
 		s_free_logent(l_logent);
 		}
 
@@ -455,10 +462,13 @@ static	ssize_t s_ser2net$ctl_write(struct file *a_filp, const char __user *a__us
 
 static	__poll_t s_ser2net$ctl_poll(struct file *a_filp, struct poll_table_struct *a_ptbl)
 {
-	if ( !list_empty(&s_logent_list) )
-		return	POLLIN;
+int	l_rc;
 
-	return	0;
+	spin_lock(&s_logent_list_lock);
+	l_rc = list_empty(&s_logent_list);
+	spin_unlock(&s_logent_list_lock);
+
+	return l_rc ? 0 : POLLIN;
 }
 
 
@@ -543,9 +553,10 @@ static void s_network_sk_data_ready (struct sock *a_sk)
 {
 SER2NET$CTX	*l_ctx = a_sk->sk_user_data;
 
-	$PUTMSG("<%s>: Wake-up! a_sk: %p, waitq: %p", l_ctx->devname, a_sk, &l_ctx->writeq);
-	atomic_add(1, &l_ctx->indata_fl);
-	wake_up_interruptible(&l_ctx->writeq);
+	atomic_add(1, &l_ctx->skread_fl);
+	wake_up_interruptible_all(&l_ctx->proc_que);
+
+	$PUTMSG("<%s>: Do Wake-up for  [proc_que: %p, a_sk: %p]", l_ctx->devname, &l_ctx->proc_que, a_sk);
 }
 
 static int s_network_proc(void *a_data)
@@ -554,15 +565,17 @@ SER2NET$CTX	*l_ctx = (SER2NET$CTX *) a_data;
 struct socket *l_sock;
 struct kvec l_iov;
 struct msghdr l_msg;
-int l_rc, l_len, l_do_loop_flag;
+int l_rc, l_len;
 SER2NET$IOBUF	*l_iobuf;
 char	*l_ptr;
 
 	$PUTMSG("<%s>: Remote link: %pI4:%d --- worker thread is started", l_ctx->devname, &l_ctx->sk.sin_addr, ntohs(l_ctx->sk.sin_port));
 
 
-	for ( l_do_loop_flag = 0;  !kthread_should_stop(); l_do_loop_flag = 0 )
+	for ( ;  !kthread_should_stop(); )
 		{
+		$PUTMSG("<%s>: Begin loop ...", l_ctx->devname);
+
 		/*
 		 * Is there data for remote host is configured ?
 		 */
@@ -582,7 +595,7 @@ char	*l_ptr;
 			{
 			if ( 0 > (l_rc = sock_create_kern(&init_net, AF_INET, SOCK_STREAM, IPPROTO_TCP, &l_sock)) )
 				{
-				$LOG(KERN_ERR, "<%s>: sock_create_kern(%pI4:%d)->%d", l_ctx->devname,
+				$PUTMSG( "<%s>: sock_create_kern(%pI4:%d)->%d", l_ctx->devname,
 				     &l_ctx->sk.sin_addr, ntohs(l_ctx->sk.sin_port), l_rc );
 
 				ssleep(3);
@@ -597,7 +610,7 @@ char	*l_ptr;
 				/*
 				 * Error ? Ok, log this situation, sleep, and will try again ...
 				 */
-				$LOG(KERN_ERR, "<%s>: kernel_connect(%pI4:%d)->%d, retry after %d seconds ...", l_ctx->devname,
+				$PUTMSG( "<%s>: kernel_connect(%pI4:%d)->%d, retry after %d seconds ...", l_ctx->devname,
 					     &l_ctx->sk.sin_addr, ntohs(l_ctx->sk.sin_port), l_rc, 3);
 
 				sock_release(l_sock);
@@ -619,11 +632,12 @@ char	*l_ptr;
 			}
 
 
+
+
 		/*
 		 * Do main I/O from serial's buffer to socket and back
 		 */
 		l_iobuf = &l_ctx->ser2net;
-		//$PUTMSG("<%s>: l_iobuf[%p, head: %d, tail: %d]", l_ctx->devname, l_iobuf, l_iobuf->head, l_iobuf->tail);
 		if ( (l_len = s_iobuf_getdata(l_iobuf, &l_ptr)) )		/* Is there something to send over network ? */
 			{
 			l_iov.iov_base = l_ptr;
@@ -633,21 +647,21 @@ char	*l_ptr;
 
 			if ( 0 > (l_rc = kernel_sendmsg(l_sock, &l_msg, &l_iov, 1, l_len)) )
 				{
-				$LOG(KERN_ERR, "<%s>: Sending to: %pI4:%d, sock: %p --- failed, errno: %d", l_ctx->devname,
+				$PUTMSG("<%s>: Sending to: %pI4:%d, sock: %p --- failed, errno: %d", l_ctx->devname,
 						&l_ctx->sk.sin_addr, ntohs(l_ctx->sk.sin_port), l_sock, l_rc);
 				}
 			else	{
 				s_iobuf_adjdata(l_iobuf, l_rc);
-				l_do_loop_flag = 1;
 
 				$PUTMSG("<%s>: Sent %d (from %d) octets", l_ctx->devname, l_rc, l_len);
 				}
 			}
 
 
+
+
 		l_iobuf = &l_ctx->net2ser;
-		//$PUTMSG("<%s>: l_iobuf[%p, head: %d, tail: %d]", l_ctx->devname, l_iobuf, l_iobuf->head, l_iobuf->tail);
-		if ( (l_len = s_iobuf_getfree(l_iobuf, &l_ptr)) )		/* Is there something to send over network ? */
+		if ( (l_len = s_iobuf_getfree(l_iobuf, &l_ptr)) )		/* Is there something from the network ? */
 			{
 			l_iov.iov_base = l_ptr;
 			l_iov.iov_len  = l_len;
@@ -656,18 +670,13 @@ char	*l_ptr;
 
 			if ( 0 < (l_rc = kernel_recvmsg(l_sock, &l_msg, &l_iov, 1, l_len, MSG_PEEK | MSG_DONTWAIT)) )
 				{
-				$PUTMSG("<%s>: l_rc: %d", l_ctx->devname, l_rc);
-
 				if ( 0 > (l_rc = kernel_recvmsg(l_sock, &l_msg, &l_iov, 1, l_len, 0)) )
 					{
-					$LOG(KERN_ERR, "<%s>: Receiving from: %pI4:%d, sock: %p --- failed, errno: %d", l_ctx->devname,
+					$PUTMSG("<%s>: Receiving from: %pI4:%d, sock: %p --- failed, errno: %d", l_ctx->devname,
 							&l_ctx->sk.sin_addr, ntohs(l_ctx->sk.sin_port), l_sock, l_rc);
 					}
 				else	{
 					s_iobuf_adjfree(l_iobuf, l_rc);
-					l_do_loop_flag = 1;
-					atomic_add(1, &l_ctx->outdata_fl);
-					wake_up_interruptible(&l_ctx->readq);
 
 					$PUTMSG("<%s>: Rcvd %d octets", l_ctx->devname, l_rc);
 					}
@@ -676,7 +685,8 @@ char	*l_ptr;
 				if ( (l_rc == -EAGAIN) || (l_rc == -EWOULDBLOCK) )
 					{
 					/* It's OK, Just no data to read */
-					l_do_loop_flag = 1;
+					//l_do_loop_flag = 1;
+					//$SHOW_INT(l_do_loop_flag);
 					}
 				else	{
 					if ( l_rc == 0 )
@@ -685,7 +695,7 @@ char	*l_ptr;
 								&l_ctx->sk.sin_addr, ntohs(l_ctx->sk.sin_port), l_sock);
 						}
 					else	{
-						$LOG(KERN_ERR, "<%s>: kernel_recvmsg(%pI4:%d, MSG_PEEK | MSG_DONTWAIT)->%d", l_ctx->devname,
+						$PUTMSG( "<%s>: kernel_recvmsg(%pI4:%d, MSG_PEEK | MSG_DONTWAIT)->%d", l_ctx->devname,
 							&l_ctx->sk.sin_addr, ntohs(l_ctx->sk.sin_port), l_rc);
 						}
 
@@ -695,23 +705,33 @@ char	*l_ptr;
 				}
 			}
 
+		if ( s_iobuf_getdata(l_iobuf, &l_ptr) )		/* Is there something to send to serial's reader ? */
+			{
+			atomic_add(1, &l_ctx->indata_fl);
+			wake_up_interruptible(&l_ctx->readq);
 
-		if ( l_do_loop_flag )
-			continue;
+			$PUTMSG("<%s>: Do Wake-up for  [readq: %p]", l_ctx->devname, &l_ctx->readq);
+			}
 
+		$PUTMSG("<%s>: Hibernate ...", l_ctx->devname);
 
-		l_rc = wait_event_interruptible_timeout(l_ctx->writeq,
-							( (atomic_read(&l_ctx->indata_fl) > 0)  ||
-							(s_buf_len(&l_ctx->net2ser) > 0)
-							|| (s_buf_len(&l_ctx->ser2net) > 0) )
+		l_rc = wait_event_interruptible_timeout(l_ctx->proc_que,
+							(
+							(atomic_read(&l_ctx->skread_fl) > 0)
+							|| (atomic_read(&l_ctx->outdata_fl) > 0)
+							|| (s_iobuf_isdata(&l_ctx->ser2net) > 0) )
 							, msecs_to_jiffies(5*1024));
 
+		$PUTMSG("<%s>: Woke-up, l_rc: %d [skread_fl: %d, indata_fl: %d, outdata_fl: %d, net2ser: %s, ser2net: %s]",
+			l_ctx->devname, l_rc,
+			atomic_read(&l_ctx->skread_fl),
+			atomic_read(&l_ctx->indata_fl), atomic_read(&l_ctx->outdata_fl),
+			s_iobuf_isdata(&l_ctx->net2ser) ? "Ready Data" : "Empty",
+			s_iobuf_isdata(&l_ctx->ser2net) ? "Ready Data" : "Empty" );
 
-		if ( l_rc < 0 )
-			$SHOW_INT(l_rc);
 
-		atomic_set(&l_ctx->indata_fl, 0);
-
+		atomic_set(&l_ctx->skread_fl, 0);
+		atomic_set(&l_ctx->outdata_fl, 0);
 		}
 
 	if ( l_ctx->flags & SER2NET$M_NET_OPEN )
@@ -774,7 +794,7 @@ char	*l_ptr;
 			{
 			if ( 0 > (l_rc = sock_create_kern(&init_net, AF_INET, SOCK_STREAM, IPPROTO_TCP, &l_sock)) )
 				{
-				$LOG(KERN_ERR, "<%s>: sock_create_kern(%pI4:%d)->%d", l_ctx->devname,
+				$PUTMSG("<%s>: sock_create_kern(%pI4:%d)->%d", l_ctx->devname,
 				     &l_ctx->sk.sin_addr, ntohs(l_ctx->sk.sin_port), l_rc );
 
 				ssleep(3);
@@ -790,7 +810,7 @@ char	*l_ptr;
 				/*
 				 * Error ? Ok, log this situation, sleep, and will try again ...
 				 */
-				$LOG(KERN_ERR, "<%s>: kernel_bind(%pI4:%d)->%d, retry after %d seconds ...", l_ctx->devname,
+				$PUTMSG( "<%s>: kernel_bind(%pI4:%d)->%d, retry after %d seconds ...", l_ctx->devname,
 					     &l_ctx->sk.sin_addr, ntohs(l_ctx->sk.sin_port), l_rc, 3);
 
 				sock_release(l_sock);
@@ -804,7 +824,7 @@ char	*l_ptr;
 				/*
 				 * Error ? Ok, log this situation, sleep, and will try again ...
 				 */
-				$LOG(KERN_ERR, "<%s>: kernel_listen(%pI4:%d)->%d, retry after %d seconds ...", l_ctx->devname,
+				$PUTMSG( "<%s>: kernel_listen(%pI4:%d)->%d, retry after %d seconds ...", l_ctx->devname,
 					     &l_ctx->sk.sin_addr, ntohs(l_ctx->sk.sin_port), l_rc, 3);
 
 				sock_release(l_sock);
@@ -818,7 +838,7 @@ char	*l_ptr;
 				/*
 				 * Error ? Ok, log this situation, sleep, and will try again ...
 				 */
-				$LOG(KERN_ERR, "<%s>: kernel_accept(%pI4:%d)->%d, retry after %d seconds ...", l_ctx->devname,
+				$PUTMSG( "<%s>: kernel_accept(%pI4:%d)->%d, retry after %d seconds ...", l_ctx->devname,
 					     &l_ctx->sk.sin_addr, ntohs(l_ctx->sk.sin_port), l_rc, 3);
 
 				sock_release(l_sock);
@@ -854,7 +874,7 @@ char	*l_ptr;
 
 			if ( 0 > (l_rc = kernel_sendmsg(l_sock, &l_msg, &l_iov, 1, l_len)) )
 				{
-				$LOG(KERN_ERR, "<%s>: Sending to: %pI4:%d, sock: %p --- failed, errno: %d", l_ctx->devname,
+				$PUTMSG( "<%s>: Sending to: %pI4:%d, sock: %p --- failed, errno: %d", l_ctx->devname,
 						&l_ctx->sk.sin_addr, ntohs(l_ctx->sk.sin_port), l_sock, l_rc);
 				}
 			else	{
@@ -881,13 +901,13 @@ char	*l_ptr;
 
 				if ( 0 > (l_rc = kernel_recvmsg(l_sock, &l_msg, &l_iov, 1, l_len, 0)) )
 					{
-					$LOG(KERN_ERR, "<%s>: Receiving from: %pI4:%d, sock: %p --- failed, errno: %d", l_ctx->devname,
+					$PUTMSG( "<%s>: Receiving from: %pI4:%d, sock: %p --- failed, errno: %d", l_ctx->devname,
 							&l_ctx->sk.sin_addr, ntohs(l_ctx->sk.sin_port), l_sock, l_rc);
 					}
 				else	{
 					s_iobuf_adjfree(l_iobuf, l_rc);
 					l_do_loop_flag = 1;
-					wake_up_interruptible(&l_ctx->readq);
+					wake_up_interruptible(&l_ctx->proc_que);
 
 					$PUTMSG("<%s>: Rcvd %d octets", l_ctx->devname, l_rc);
 					}
@@ -904,7 +924,7 @@ char	*l_ptr;
 								&l_ctx->sk.sin_addr, ntohs(l_ctx->sk.sin_port), l_sock);
 						}
 					else	{
-						$LOG(KERN_ERR, "<%s>: kernel_recvmsg(%pI4:%d, MSG_PEEK | MSG_DONTWAIT)->%d", l_ctx->devname,
+						$PUTMSG( "<%s>: kernel_recvmsg(%pI4:%d, MSG_PEEK | MSG_DONTWAIT)->%d", l_ctx->devname,
 							&l_ctx->sk.sin_addr, ntohs(l_ctx->sk.sin_port), l_rc);
 						}
 
@@ -918,8 +938,8 @@ char	*l_ptr;
 		if ( l_do_loop_flag )
 			continue;
 
-		l_rc = wait_event_interruptible_timeout(l_ctx->writeq,
-							(s_buf_len(&l_ctx->net2ser) > 0)
+		l_rc = wait_event_interruptible_timeout(l_ctx->readq,
+							(s_iobuf_isdata(&l_ctx->net2ser) > 0)
 							, msecs_to_jiffies(5*1024));
 		}
 
@@ -1027,10 +1047,6 @@ static int s_serial_release(struct inode *a_inode, struct file *a_filp)
 {
 SER2NET$CTX	*l_ctx;
 
-	//$PUTMSG("a_inode: %p, a_filep: %p, .path=<%s>, .private_data=%p", a_inode, a_filp,
-	//       a_filp->f_path.dentry->d_name.name,
-	//       a_filp->private_data);
-
 	mutex_lock(&s_open_close_mutex);
 
 	if ( !(l_ctx = a_filp->private_data) )
@@ -1042,6 +1058,12 @@ SER2NET$CTX	*l_ctx;
 
 	if ( (l_ctx->flags & SER2NET$M_SER_OPEN) )
 		l_ctx->flags &=  (~SER2NET$M_SER_OPEN);
+
+	s_iobuf_reset(&l_ctx->net2ser);
+	s_iobuf_reset(&l_ctx->ser2net);
+
+	atomic_set(&l_ctx->indata_fl, 0);
+	atomic_set(&l_ctx->outdata_fl, 0);
 
 	mutex_unlock(&s_open_close_mutex);
 
@@ -1095,10 +1117,10 @@ char	*l_ptr;
 
 	/* Wait until data is available */
 	l_rc = wait_event_interruptible(l_ctx->readq,
-					( (atomic_read(&l_ctx->outdata_fl) > 0)
-					|| (s_iobuf_getdata(l_iobuf, &l_ptr) > 0) ) );
+					( (atomic_read(&l_ctx->indata_fl) > 0)
+					|| (s_iobuf_isdata(l_iobuf) > 0)
+						) );
 
-	atomic_set(&l_ctx->outdata_fl, 0);
 
 	l_len = s_iobuf_getdata(l_iobuf, &l_ptr);
 	l_len = min(l_len, a_count);
@@ -1133,7 +1155,12 @@ char	*l_ptr;
 	if ( !a_count )
 		return 0;
 
+
 	l_ctx = a_filp->private_data;
+
+	if ( !(l_ctx->flags & SER2NET$M_SER_OPEN) )
+		return	-EIO;
+
 	l_iobuf = &l_ctx->ser2net;
 
 
@@ -1148,12 +1175,15 @@ char	*l_ptr;
 
 	s_iobuf_adjfree(l_iobuf, l_len);					/* Adjust <head> */
 
-	$PUTMSG("<%s>: Wrote %ld (from: %d) octets", l_ctx->devname, l_len, a_count);
 
 	/*
 	 * Send signal to weak-up a thread to send data over network
 	 */
-	wake_up_interruptible(&l_ctx->writeq);
+	atomic_set(&l_ctx->outdata_fl, 1);
+	wake_up_interruptible(&l_ctx->proc_que);
+
+	$PUTMSG("<%s>: Wrote %ld (from: %ld) octets", l_ctx->devname, l_len, a_count);
+	$PUTMSG("<%s>: Do Wake-up for  [proc_que: %p]", l_ctx->devname, &l_ctx->proc_que);
 
 	return l_len;
 }
@@ -1167,13 +1197,19 @@ SER2NET$CTX	*l_ctx;
 char	*l_ptr;
 
 	l_ctx = a_filp->private_data;
+
+
+	if ( !(l_ctx->flags & SER2NET$M_SER_OPEN) )
+		return	-EIO;
+
+
 	l_rc = 0;
 
 	if ( s_iobuf_getfree(&l_ctx->ser2net, &l_ptr) )			/* Check a free space in output buffer */
-		l_rc = POLLOUT;
+		l_rc |= POLLOUT;
 
-	if ( s_iobuf_getdata(&l_ctx->net2ser, &l_ptr) )			/* Check for data to be read from input buffer */
-		l_rc = POLLIN;
+	if ( s_iobuf_isdata(&l_ctx->net2ser) )				/* Check for data to be read from input buffer */
+		l_rc |= POLLIN;
 
 	$PUTMSG("<%s>: Do Poll, revents: %0x", l_ctx->devname, l_rc);
 
@@ -1336,8 +1372,8 @@ SER2NET$CTX	*l_ctx;
 			}
 
 
+		init_waitqueue_head(&l_ctx->proc_que);
 		init_waitqueue_head(&l_ctx->readq);
-		init_waitqueue_head(&l_ctx->writeq);
 
 #if 0
 		{/* Just for debug purpose set parameters for ser2net00 link */
@@ -1417,14 +1453,14 @@ char	*l_cp;
 		$LOG(KERN_ERR, "Initialization of control device failed, errno: %d", l_rc);
 		return	l_rc;
 		}
-
+#if 1
 	if ( (l_rc = s_ser2net_ctxs_init()) )
 		{
 		$LOG(KERN_ERR, "Initialization of context failed, errno: %d", l_rc);
 		return	l_rc;
 		}
 
-
+#endif
 	$LOG(KERN_INFO, "%d contexts is initialized", p_ser2net_max);
 
 	return	0;
@@ -1458,3 +1494,109 @@ int	l_rc;
 
 module_init(s_module_init);
 module_exit(s_module_exit);
+
+
+
+
+#else
+
+
+
+/* misc_read_demo.c – простой misc‑char драйвер с read() */
+
+#include <linux/module.h>
+#include <linux/fs.h>
+#include <linux/miscdevice.h>
+#include <linux/uaccess.h>
+
+#define DEV_NAME   "my_misc"
+#define BUF_SIZE   1024
+
+static char dev_buffer[BUF_SIZE];
+static size_t data_len;   /* количество действительных данных в буфере */
+
+/* --------------------------------------------------------------------- */
+/*  read() – копирует данные пользователю, корректно обрабатывая offset   */
+static ssize_t dev_read(struct file *filp,
+			char __user *buf,
+			size_t count,
+			loff_t *ppos)
+{
+    size_t available;
+    ssize_t to_copy;
+
+    /* Если позиция уже за пределами данных – EOF */
+    if (*ppos >= data_len)
+	return 0;
+
+    /* Сколько байт доступно для чтения */
+    available = data_len - *ppos;
+
+    /* Читаем не более запрошенного количества */
+    to_copy = min(count, available);
+
+    /* Копируем в пользовательское пространство */
+    if (copy_to_user(buf, dev_buffer + *ppos, to_copy))
+	return -EFAULT;
+
+    /* Обновляем позицию */
+    *ppos += to_copy;
+
+    return to_copy;
+}
+
+/* --------------------------------------------------------------------- */
+/*  write() – заполняет буфер (чтобы было откуда читать) */
+static ssize_t dev_write(struct file *filp,
+			 const char __user *buf,
+			 size_t count,
+			 loff_t *ppos)
+{
+    size_t to_copy = min(count, (size_t)BUF_SIZE);
+
+    if (copy_from_user(dev_buffer, buf, to_copy))
+	return -EFAULT;
+
+    data_len = to_copy;
+    *ppos = 0;               /* сбрасываем позицию для последующего read */
+    return to_copy;
+}
+
+/* --------------------------------------------------------------------- */
+static const struct file_operations fops = {
+    .owner   = THIS_MODULE,
+    .read    = dev_read,
+    .write   = dev_write,
+    .llseek  = default_llseek,
+};
+
+static struct miscdevice misc_dev = {
+    .minor = MISC_DYNAMIC_MINOR,
+    .name  = DEV_NAME,
+    .fops  = &fops,
+};
+
+/* --------------------------------------------------------------------- */
+static int __init misc_demo_init(void)
+{
+    int ret = misc_register(&misc_dev);
+    if (ret)
+	pr_err("misc_register failed: %d\n", ret);
+    else
+	pr_info("misc device /dev/%s registered\n", DEV_NAME);
+    return ret;
+}
+
+static void __exit misc_demo_exit(void)
+{
+    misc_deregister(&misc_dev);
+    pr_info("misc device /dev/%s deregistered\n", DEV_NAME);
+}
+
+module_init(misc_demo_init);
+module_exit(misc_demo_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Your Name");
+MODULE_DESCRIPTION("Demo misc‑char driver with read()");
+#endif

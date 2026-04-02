@@ -41,6 +41,24 @@ typedef struct ser2net_iobuf_t {
 	char		data[SER2NET$SZ_IOBUF];
 } SER2NET$IOBUF;
 
+/*
+ *   DESCRIPTION: Reset buffer's internal structure
+ *
+ *   INPUTS:
+ *	a_iobuf:	A buffer to check
+ *
+ *   OUTPUTS:
+ *	NONE:
+ *
+ *   RETURNS:
+ *	NONE
+ */
+static inline size_t s_iobuf_reset(
+		SER2NET$IOBUF	*a_iobuf
+		)
+{
+	return a_iobuf->tail = a_iobuf->head = 0;
+}
 
 /*
  *   DESCRIPTION: Check for data in the given buffer
@@ -55,7 +73,7 @@ typedef struct ser2net_iobuf_t {
  *	0:	No data
  *	1:	Data is in buffer
  */
-static inline size_t s_buf_len(
+static inline size_t s_iobuf_isdata(
 		SER2NET$IOBUF	*a_iobuf
 		)
 {
@@ -201,8 +219,8 @@ typedef struct ser2net_ctx_t {
 	SER2NET$IOBUF	ser2net,			/* I/O buffer for serial-to-network direction */
 			net2ser;			/*  --//--        network-to-serial --//--    */
 
-	struct wait_queue_head readq,			/* Incoming data in the <net2ser> buffer is ready */
-			writeq;				/*       --//--         <ser2net> --//-- */
+	struct wait_queue_head proc_que,			/* Outgoing data in the <ser2net> buffer is ready */
+			readq;				/* Incoming data in the <net2ser> buffer is ready */
 
 	struct sockaddr_in sk;				/* Socket for remote peer */
 
@@ -213,6 +231,7 @@ typedef struct ser2net_ctx_t {
 
 	struct tty_struct tty;
 	atomic_t	indata_fl,
+			skread_fl,
 			outdata_fl;
 } SER2NET$CTX;
 
