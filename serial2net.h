@@ -209,6 +209,13 @@ enum {
 	SER2NET$M_NET_HUB = (1 << 2),
 };
 
+enum {
+	SER2NET$K_SEQ_CUR = 0,
+	SER2NET$K_SEQ_OLD,
+
+	SER2NET$K_SEQ_MAX
+};
+
 
 typedef struct ser2net_ctx_t {
 	int	flags;
@@ -219,7 +226,7 @@ typedef struct ser2net_ctx_t {
 	SER2NET$IOBUF	ser2net,			/* I/O buffer for serial-to-network direction */
 			net2ser;			/*  --//--        network-to-serial --//--    */
 
-	struct wait_queue_head proc_que,			/* Outgoing data in the <ser2net> buffer is ready */
+	struct wait_queue_head proc_que,		/* Outgoing data in the <ser2net> buffer is ready */
 			readq;				/* Incoming data in the <net2ser> buffer is ready */
 
 	struct sockaddr_in sk;				/* Socket for remote peer */
@@ -230,9 +237,11 @@ typedef struct ser2net_ctx_t {
 	struct cdev	scdev;
 
 	struct tty_struct tty;
-	atomic_t	indata_fl,
-			skread_fl,
-			outdata_fl;
+
+
+	int		skread_seq,
+			indata_seq[SER2NET$K_SEQ_MAX],
+			outdata_seq;
 } SER2NET$CTX;
 
 

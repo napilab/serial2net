@@ -1,7 +1,7 @@
 #if 1
 #define	__MODULE__	"SER2NET"
-#define	__IDENT__	"X.00-07"
-#define	__REV__		"00.07.00"
+#define	__IDENT__	"X.00-08"
+#define	__REV__		"00.08.00"
 
 /*
 **++
@@ -81,6 +81,7 @@
 **	 1-APR-2026	RRL	X.00-06ECO1: Fixed segmentation fault on "tail -f /dev/ser2net"
 **
 **	 2-APR-2026	RRL	X.00-07: Fixed CPU consuming and losing of I/O events.
+**				X.00-08: Performance improved version: eliminate using atomics.
 **
 **
 **--
@@ -119,8 +120,8 @@
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("A yet anoteher driver to pass serial I/O over network");
 
-static const char s_author_desc [] =  "Ruslan R. Laishev (AKA: BadAss Sysman, SysManOne), zator@yandex.ru";
-MODULE_AUTHOR("Ruslan R. Laishev (AKA: BadAss Sysman, SysManOne), zator@yandex.ru");
+static const char s_author_desc [] =  "Ruslan R. Laishev (AKA: BadAss SysMan, SysManOne), zator@yandex.ru";
+MODULE_AUTHOR("Ruslan R. Laishev (AKA: BadAss SysMan, SysManOne), zator@yandex.ru");
 
 
 static int p_ser2net_trace = 1;
@@ -154,7 +155,6 @@ MODULE_PARM_DESC(p_serial2net_hub, "Switch drive in Hub\\Server mode");
 #define $TRACE(fmt, ...)	do { if (p_ser2net_trace) printk(KERN_DEBUG  "[ %#x " __MODULE__ "\\%s:%d] " fmt "\n", current->tgid, __FUNCTION__,  __LINE__ , ## __VA_ARGS__); } while (0)
 #define $LOG(lvl, fmt, ...)	do { printk(lvl  "[ %#x " __MODULE__ "\\%s:%d] " fmt "\n", current->tgid, __FUNCTION__,  __LINE__ , ## __VA_ARGS__); } while (0)
 #define $PUTMSG(fmt, ...)	s_ser2net$ctl_putmsg(fmt "\n", __FUNCTION__,  __LINE__ , ## __VA_ARGS__)
-//#define $PUTMSG(fmt, ...)	do { if (p_ser2net_trace) printk(KERN_ALERT  "[ %#x " __MODULE__ "\\%s:%d] " fmt "\n", current->tgid, __FUNCTION__,  __LINE__ , ## __VA_ARGS__); } while (0)
 #else
 	#define	$TRACE(fmt, ...)	{}
 	#define $LOG(lvl, fmt, ...)	{ printk(lvl  "[ %#x " __MODULE__ "] " fmt "\n", current->tgid, ## __VA_ARGS__); }
@@ -216,6 +216,21 @@ struct kmem_cache	*s_logent_cache;
 static mempool_t	*s_logent_pool;
 
 
+/*
+ *   DESCRIPTION: Create a SLAB and linked cache for LOGENT chunks
+ *
+ *   INPUTS:
+ *	a_defent_nr:	A default number for prealocated entries
+ *	a_entsz:	A size of meory chunk for LOGNET
+ *
+ *   IMPLICITE OUTPUTS:
+ *	s_logent_cache
+ *	s_logent_pool
+ *
+ *   RETURNS:
+ *	0:	SUCCESS
+ *	<errno>
+ */
 static int	s_cre_logent_slab	(
 				int	a_defent_nr,
 				size_t	a_entsz
@@ -239,6 +254,21 @@ static int	s_cre_logent_slab	(
 	return	0;
 }
 
+/*
+ *   DESCRIPTION: Delate SLAB and cache
+ *
+ *   IMPLICITE INPUTS:
+ *	s_logent_cache
+ *	s_logent_pool
+ *
+ *   IMPLICITE OUTPUTS:
+ *	s_logent_cache
+ *	s_logent_pool
+ *
+ *   RETURNS:
+ *	0:	SUCCESS
+ *	<errno>
+ */
 static void	s_del_logent_slab	(void)
 {
 LOGENT	*l_logent, *l_tmp;
@@ -254,6 +284,17 @@ LOGENT	*l_logent, *l_tmp;
 	kmem_cache_destroy(s_logent_cache);
 }
 
+/*
+ *   DESCRIPTION: Get memory chunk from cache for a new LOGENT,
+ *	initialize link field.
+ *
+ *   OUTPUTS:
+ *	a_logent:	A new memory chunkc for LOGENT
+ *
+ *   RETURNS:
+ *	0:	SUCCESS
+ *	<errno>
+ */
 
 static inline int	s_get_logent (
 			LOGENT		**a_logent
@@ -271,6 +312,17 @@ static inline int	s_get_logent (
 	INIT_LIST_HEAD(&(*a_logent)->link);
 	return	0;
 }
+
+/*
+ *   DESCRIPTION: Return memory chunk for LOGENT to SLAB\cache.
+ *
+ *   INPUTS:
+ *	a_logent:	A LOGENT's chunk to be rtealized
+ *
+ *   RETURNS:
+ *	NONE
+ */
+
 
 static inline void	s_free_logent (
 		LOGENT		*a_logent
@@ -312,6 +364,7 @@ va_list a_arglist;
 LOGENT	*l_logent;
 const char	l_lfmt [] = {"[%05lld.%06ld] [%#4x #%08llx " __MODULE__ "\\%s:%d] "};
 static	atomic64_t	l_seq;
+
 
 	if ( (l_rc = s_get_logent(&l_logent)) )					/* Get free entry for log message */
 		return;
@@ -553,7 +606,7 @@ static void s_network_sk_data_ready (struct sock *a_sk)
 {
 SER2NET$CTX	*l_ctx = a_sk->sk_user_data;
 
-	atomic_add(1, &l_ctx->skread_fl);
+	l_ctx->skread_seq += 1;							/* Count this event */
 	wake_up_interruptible_all(&l_ctx->proc_que);
 
 	$PUTMSG("<%s>: Do Wake-up for  [proc_que: %p, a_sk: %p]", l_ctx->devname, &l_ctx->proc_que, a_sk);
@@ -568,9 +621,11 @@ struct msghdr l_msg;
 int l_rc, l_len;
 SER2NET$IOBUF	*l_iobuf;
 char	*l_ptr;
+int	l_skread_seq, l_outdata_seq;
 
 	$PUTMSG("<%s>: Remote link: %pI4:%d --- worker thread is started", l_ctx->devname, &l_ctx->sk.sin_addr, ntohs(l_ctx->sk.sin_port));
 
+	l_skread_seq = l_outdata_seq = -1;
 
 	for ( ;  !kthread_should_stop(); )
 		{
@@ -707,7 +762,7 @@ char	*l_ptr;
 
 		if ( s_iobuf_getdata(l_iobuf, &l_ptr) )		/* Is there something to send to serial's reader ? */
 			{
-			atomic_add(1, &l_ctx->indata_fl);
+			l_ctx->indata_seq[SER2NET$K_SEQ_CUR] += 1;
 			wake_up_interruptible(&l_ctx->readq);
 
 			$PUTMSG("<%s>: Do Wake-up for  [readq: %p]", l_ctx->devname, &l_ctx->readq);
@@ -717,21 +772,23 @@ char	*l_ptr;
 
 		l_rc = wait_event_interruptible_timeout(l_ctx->proc_que,
 							(
-							(atomic_read(&l_ctx->skread_fl) > 0)
-							|| (atomic_read(&l_ctx->outdata_fl) > 0)
+							(l_skread_seq != l_ctx->skread_seq)
+							|| (l_outdata_seq != l_ctx->outdata_seq)
 							|| (s_iobuf_isdata(&l_ctx->ser2net) > 0) )
 							, msecs_to_jiffies(5*1024));
 
-		$PUTMSG("<%s>: Woke-up, l_rc: %d [skread_fl: %d, indata_fl: %d, outdata_fl: %d, net2ser: %s, ser2net: %s]",
+		$PUTMSG("<%s>: Woke-up, l_rc: %d [skread_seq: %d, indata_seq: %d, outdata_seq: %d, net2ser: %s, ser2net: %s]",
 			l_ctx->devname, l_rc,
-			atomic_read(&l_ctx->skread_fl),
-			atomic_read(&l_ctx->indata_fl), atomic_read(&l_ctx->outdata_fl),
+			l_ctx->skread_seq,
+			l_ctx->indata_seq[SER2NET$K_SEQ_CUR],
+			l_ctx->outdata_seq,
 			s_iobuf_isdata(&l_ctx->net2ser) ? "Ready Data" : "Empty",
 			s_iobuf_isdata(&l_ctx->ser2net) ? "Ready Data" : "Empty" );
 
 
-		atomic_set(&l_ctx->skread_fl, 0);
-		atomic_set(&l_ctx->outdata_fl, 0);
+
+		l_skread_seq = l_ctx->skread_seq;
+		l_outdata_seq = l_ctx->outdata_seq;
 		}
 
 	if ( l_ctx->flags & SER2NET$M_NET_OPEN )
@@ -1062,8 +1119,9 @@ SER2NET$CTX	*l_ctx;
 	s_iobuf_reset(&l_ctx->net2ser);
 	s_iobuf_reset(&l_ctx->ser2net);
 
-	atomic_set(&l_ctx->indata_fl, 0);
-	atomic_set(&l_ctx->outdata_fl, 0);
+	l_ctx->outdata_seq = 0;
+	l_ctx->indata_seq[SER2NET$K_SEQ_CUR] = 0;
+	l_ctx->indata_seq[SER2NET$K_SEQ_OLD] = 0;
 
 	mutex_unlock(&s_open_close_mutex);
 
@@ -1117,9 +1175,10 @@ char	*l_ptr;
 
 	/* Wait until data is available */
 	l_rc = wait_event_interruptible(l_ctx->readq,
-					( (atomic_read(&l_ctx->indata_fl) > 0)
-					|| (s_iobuf_isdata(l_iobuf) > 0)
-						) );
+					( l_ctx->indata_seq[SER2NET$K_SEQ_CUR] != l_ctx->indata_seq[SER2NET$K_SEQ_OLD] )
+					|| (s_iobuf_isdata(l_iobuf) > 0) );
+
+	l_ctx->indata_seq[SER2NET$K_SEQ_OLD] = l_ctx->indata_seq[SER2NET$K_SEQ_OLD];
 
 
 	l_len = s_iobuf_getdata(l_iobuf, &l_ptr);
@@ -1179,7 +1238,7 @@ char	*l_ptr;
 	/*
 	 * Send signal to weak-up a thread to send data over network
 	 */
-	atomic_set(&l_ctx->outdata_fl, 1);
+	l_ctx->outdata_seq += 1;
 	wake_up_interruptible(&l_ctx->proc_que);
 
 	$PUTMSG("<%s>: Wrote %ld (from: %ld) octets", l_ctx->devname, l_len, a_count);
@@ -1501,102 +1560,4 @@ module_exit(s_module_exit);
 #else
 
 
-
-/* misc_read_demo.c – простой misc‑char драйвер с read() */
-
-#include <linux/module.h>
-#include <linux/fs.h>
-#include <linux/miscdevice.h>
-#include <linux/uaccess.h>
-
-#define DEV_NAME   "my_misc"
-#define BUF_SIZE   1024
-
-static char dev_buffer[BUF_SIZE];
-static size_t data_len;   /* количество действительных данных в буфере */
-
-/* --------------------------------------------------------------------- */
-/*  read() – копирует данные пользователю, корректно обрабатывая offset   */
-static ssize_t dev_read(struct file *filp,
-			char __user *buf,
-			size_t count,
-			loff_t *ppos)
-{
-    size_t available;
-    ssize_t to_copy;
-
-    /* Если позиция уже за пределами данных – EOF */
-    if (*ppos >= data_len)
-	return 0;
-
-    /* Сколько байт доступно для чтения */
-    available = data_len - *ppos;
-
-    /* Читаем не более запрошенного количества */
-    to_copy = min(count, available);
-
-    /* Копируем в пользовательское пространство */
-    if (copy_to_user(buf, dev_buffer + *ppos, to_copy))
-	return -EFAULT;
-
-    /* Обновляем позицию */
-    *ppos += to_copy;
-
-    return to_copy;
-}
-
-/* --------------------------------------------------------------------- */
-/*  write() – заполняет буфер (чтобы было откуда читать) */
-static ssize_t dev_write(struct file *filp,
-			 const char __user *buf,
-			 size_t count,
-			 loff_t *ppos)
-{
-    size_t to_copy = min(count, (size_t)BUF_SIZE);
-
-    if (copy_from_user(dev_buffer, buf, to_copy))
-	return -EFAULT;
-
-    data_len = to_copy;
-    *ppos = 0;               /* сбрасываем позицию для последующего read */
-    return to_copy;
-}
-
-/* --------------------------------------------------------------------- */
-static const struct file_operations fops = {
-    .owner   = THIS_MODULE,
-    .read    = dev_read,
-    .write   = dev_write,
-    .llseek  = default_llseek,
-};
-
-static struct miscdevice misc_dev = {
-    .minor = MISC_DYNAMIC_MINOR,
-    .name  = DEV_NAME,
-    .fops  = &fops,
-};
-
-/* --------------------------------------------------------------------- */
-static int __init misc_demo_init(void)
-{
-    int ret = misc_register(&misc_dev);
-    if (ret)
-	pr_err("misc_register failed: %d\n", ret);
-    else
-	pr_info("misc device /dev/%s registered\n", DEV_NAME);
-    return ret;
-}
-
-static void __exit misc_demo_exit(void)
-{
-    misc_deregister(&misc_dev);
-    pr_info("misc device /dev/%s deregistered\n", DEV_NAME);
-}
-
-module_init(misc_demo_init);
-module_exit(misc_demo_exit);
-
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Your Name");
-MODULE_DESCRIPTION("Demo misc‑char driver with read()");
 #endif
