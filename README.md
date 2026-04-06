@@ -1,8 +1,26 @@
 #	SER2NET - A yet another Linux driver to pass serial-like port over network
 
 ###	Abstract
-*This is a trivial Linux driver implements serial-like device, pass all I/O as-is over TCP-connection to
+*This is a trivial Linux driver implemented serial-like device. Pass all I/O as-is over TCP-connection to
 a remote "server". Remote server is a something like StarLet MODBUS TCP-to-RTU gateway or StarLet NET-to-SERIAL gateway.*
+
+
+###	NaPi World
+This project is developed and maintained by the NaPi Lab team
+and is primarily tested on NaPi industrial single-board computers based on Rockchip SoCs.
+
+####	NaPi Boards
+If you are looking for a reliable hardware platform to run MODBUS transport sowftware in production,
+check out the NaPi board lineup:
+
+Welcome to NaPi Wolrd (https://github.com/napilab/napi-boards) for more information!
+
+Right now is available:
+
+- NAPI2 — RK3568J, RS-485 onboard, Armbian
+- NAPI-C — RK3308, compact, industrial grade
+
+
 
 ###	Usage
 ```
