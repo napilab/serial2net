@@ -77,7 +77,7 @@ static inline size_t s_iobuf_isdata(
 		SER2NET$IOBUF	*a_iobuf
 		)
 {
-	return a_iobuf->tail != a_iobuf->head;
+	return a_iobuf->fl_full || (a_iobuf->tail != a_iobuf->head);
 }
 
 

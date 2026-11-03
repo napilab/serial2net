@@ -1,7 +1,7 @@
 #if 1
 #define	__MODULE__	"SER2NET"
-#define	__IDENT__	"X.00-08"
-#define	__REV__		"00.08.00"
+#define	__IDENT__	"X.00-08ECO1"
+#define	__REV__		"00.08.01"
 
 /*
 **++
@@ -82,6 +82,11 @@
 **
 **	 2-APR-2026	RRL	X.00-07: Fixed CPU consuming and losing of I/O events.
 **				X.00-08: Performance improved version: eliminate using atomics.
+**
+**	 3-NOV-2026	RRL	X.00-08ECO1: Fixed a stall of the receive path (a full ring looked empty in poll/read, no poll_wait(),
+**				the reader did not wake the network worker, OLD sequence was never updated); fixed unbounded growth
+**				of the /dev/ser2net message queue when nobody reads it (LOGENT$MAX_NR) - OOM on a long transfer;
+**				kernel 7.x: kernel_connect()/kernel_bind() take struct sockaddr_unsized; Makefile: obj-m without "./".
 **
 **
 **--
@@ -200,6 +205,7 @@ static struct miscdevice s_ser2net$ctl;							/* Pseudo-device to accept IOCTL c
  */
 #define		LOGENT$SZ_MSG		256
 #define		LOGENT$SZ_DEFENT_NR	132
+#define		LOGENT$MAX_NR		4096
 static LIST_HEAD(s_logent_list);							/* A list of log messages */
 static atomic64_t	s_logent_list_nr;						/* A number of entries in the <s_logent_listlist> */
 DEFINE_SPINLOCK(s_logent_list_lock);							/* A spinlock to coordinate access to the <s_logent_list> */
@@ -365,6 +371,9 @@ LOGENT	*l_logent;
 const char	l_lfmt [] = {"[%05lld.%06ld] [%#4x #%08llx " __MODULE__ "\\%s:%d] "};
 static	atomic64_t	l_seq;
 
+
+	if ( atomic64_read(&s_logent_list_nr) >= LOGENT$MAX_NR )		/* Nobody reads /dev/ser2net: do not eat all the memory */
+		return;
 
 	if ( (l_rc = s_get_logent(&l_logent)) )					/* Get free entry for log message */
 		return;
@@ -660,7 +669,7 @@ int	l_skread_seq, l_outdata_seq;
 			$PUTMSG("<%s>: Connecting to: %pI4:%d ...", l_ctx->devname,
 					     &l_ctx->sk.sin_addr, ntohs(l_ctx->sk.sin_port));
 
-			if (0 > (l_rc = kernel_connect(l_sock, (struct sockaddr *)&l_ctx->sk, sizeof(struct sockaddr), O_RDWR) ) )
+			if (0 > (l_rc = kernel_connect(l_sock, (void *)&l_ctx->sk, sizeof(struct sockaddr), O_RDWR) ) )
 				{
 				/*
 				 * Error ? Ok, log this situation, sleep, and will try again ...
@@ -862,7 +871,7 @@ char	*l_ptr;
 					     &l_ctx->sk.sin_addr, ntohs(l_ctx->sk.sin_port));
 
 
-			if ( 0 > (l_rc = kernel_bind(l_sock, (struct sockaddr *)&l_ctx->sk, sizeof(struct sockaddr))) )
+			if ( 0 > (l_rc = kernel_bind(l_sock, (void *)&l_ctx->sk, sizeof(struct sockaddr))) )
 				{
 				/*
 				 * Error ? Ok, log this situation, sleep, and will try again ...
@@ -1178,7 +1187,7 @@ char	*l_ptr;
 					( l_ctx->indata_seq[SER2NET$K_SEQ_CUR] != l_ctx->indata_seq[SER2NET$K_SEQ_OLD] )
 					|| (s_iobuf_isdata(l_iobuf) > 0) );
 
-	l_ctx->indata_seq[SER2NET$K_SEQ_OLD] = l_ctx->indata_seq[SER2NET$K_SEQ_OLD];
+	l_ctx->indata_seq[SER2NET$K_SEQ_OLD] = l_ctx->indata_seq[SER2NET$K_SEQ_CUR];
 
 
 	l_len = s_iobuf_getdata(l_iobuf, &l_ptr);
@@ -1191,6 +1200,8 @@ char	*l_ptr;
 		return	-EFAULT;
 
 	s_iobuf_adjdata(l_iobuf, l_len);					/* Adjust <head> */
+	l_ctx->skread_seq += 1;						/* The ring got free space: let the network worker refill it */
+	wake_up_interruptible_all(&l_ctx->proc_que);
 
 
 	$PUTMSG("<%s>: Read %ld octets", l_ctx->devname, l_len);
@@ -1261,6 +1272,8 @@ char	*l_ptr;
 	if ( !(l_ctx->flags & SER2NET$M_SER_OPEN) )
 		return	-EIO;
 
+
+	poll_wait(a_filp, &l_ctx->readq, a_ptbl);			/* Register to be woken when data arrive */
 
 	l_rc = 0;
 

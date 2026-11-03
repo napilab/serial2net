@@ -1,4 +1,4 @@
-obj-m += ./serial2net.o
+obj-m += serial2net.o
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
 PWD  := $(shell pwd)
