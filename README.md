@@ -97,3 +97,25 @@ root@devuan4-sysman:/sysman/Works/DOK/serial2net# tail -f /dev/ser2net
 [187020.000458] [0xa4f6 #00000057 SER2NET\s_network_proc:577] <ser2net00>: Connecting to: 127.0.0.1:8135 ...
 [187023.000523] [0xa4f6 #00000058 SER2NET\s_network_proc:577] <ser2net00>: Connecting to: 127.0.0.1:8135 ...
 ```
+
+
+###	Notes
+- `/dev/ser2net` is a pseudo-device with the messages of the driver (`tail -f /dev/ser2net`). Since X.00-08ECO1 it keeps at most 4096 messages
+  when nobody reads it, the next ones are dropped (before, the queue was unbounded and could eat all the memory of a small board).
+- The remote end can be a RAW listener of the `mbusgw-t2r` gateway (`mode = "RAW"`): a program opens `/dev/ser2net00` (`mbpoll -m rtu`, `minicom`,
+  `pyserial`) and works with the serial line of the gateway as with a local port. The speed and the parity are taken from the gateway.
+- Tested on NAPI-C (kernel 7.3.0-rc7-edge): 1 MiB each way in blocks with CRC32 (no loss), four ports at once, 115200.
+
+
+###	Coding style
+The driver is written in the OpenVMS C style (the "VMS style"), a patch is expected to follow it:
+
+- Whitesmiths braces (a brace on its own line, indented together with the body; the braces of a routine body are not indented), only tabs
+  (8 columns), no spaces, lines up to 192 columns.
+- Prefixes: `g_` global, `l_` local, `s_` static (routines too), `a_` routine arguments, `m_` bit masks, `v_` bit fields.
+  `$` separates the words of macros and constants (`SER2NET$K_SEQ_CUR`); structures get the `_t` suffix.
+- A file starts with `__MODULE__`, `__IDENT__` and `__REV__` (`X.00-08ECO1` is `00.08.01`), then a VMS-style header: the facility, the abstract,
+  the usage and the modification history. Every revision is recorded there.
+- It is kernel code, so the messages go through the macros of the module itself: `$LOG` (printk), `$TRACE` (printk, only if `p_ser2net_trace`)
+  and `$PUTMSG` (the queue of `/dev/ser2net`), not through bare `printk` calls. A routine returns a status, the results go through the output
+  parameters, and the error value (`errno`) is always logged.
